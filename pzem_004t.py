@@ -1,6 +1,7 @@
 import sys
 import re
 import serial
+import psutil
 from time import sleep
 
 
@@ -15,14 +16,20 @@ class MeasurementStatistics:
     REQUIRED_FIELDS = [
         "Voltage", "Current", "Power"
     ]
+    DATASET_FIELDS = [
+        "timedelta", "taskCPU", "totalCPU", "taskPower", "totalPower"
+    ]
+
     validation_table = {
         "Voltage": {"suffix": "V", "low": 190, "high": 260},
         "Current": {"suffix": "A", "low": 0, "high": 100},
         "Power": {"suffix": "W", "low": 0, "high": 10000},
     }
-    def __init__(self):
+    def __init__(self, floor_power: float = 0):
         self.data = None
         self.active = False
+        self.process_dict = {}
+        self.floor_power = floor_power
         
     def __validate(self, field, value) -> float:
         """
@@ -50,17 +57,16 @@ class MeasurementStatistics:
         if low_limit <= numeric_value <= high_limit:
             return numeric_value
         return None
-
-    def start(self, power_min=0):
+    
+    def start(self):
         """Start recording measurements."""
         if self.active:
             raise MeasurementError("Measurement is already active.")
-        self.data = pd.DataFrame(columns=["timedelta"] + self.REQUIRED_FIELDS)
+        self.data = pd.DataFrame(columns=self.DATASET_FIELDS)
         self.active = True
         self.error_count = 0
         self.total_measures = 0
         self.start_time = datetime.now()
-        self.power_min = power_min
 
     def __integrate_energy(self, energyCol: str, powerCol: str):
         self.data[energyCol] = 0.0
@@ -80,11 +86,39 @@ class MeasurementStatistics:
         if not self.active:
             raise MeasurementError("Measurement is not active.")
         self.active = False
-        self.data['taskPower'] = self.data['Power'].apply(lambda x: max(x - self.power_min, 0))
+        self.data['taskPower'] = [max(power - self.floor_power, 0) for power in self.data['totalPower'] ]
 
         print("Measurement ended.")
-        self.__integrate_energy('Energy', 'Power')
+        self.__integrate_energy('totalEnergy', 'totalPower')
         self.__integrate_energy('taskEnergy', 'taskPower')
+    
+    def process_dict_update(self, process: psutil.Process) -> psutil.Process:
+        if process.pid not in self.process_dict:
+            self.process_dict[process.pid] = process
+            return process
+        else:
+            return self.process_dict[process.pid]
+
+    def get_cpu_load(self):
+        taskCPU = 0
+        totalCPU = 0
+        try:
+            root_name = "containerd-shim-runc-v2"
+            root_pid = 0 
+            for process in psutil.process_iter(['pid', 'name']):
+                if process.info['name'] == root_name:
+                    root_pid = process.info['pid']
+                    break
+            process = self.process_dict_update(psutil.Process(root_pid))
+            ncores = psutil.cpu_count(logical=True)
+            taskCPU = process.cpu_percent(interval=0)
+            for child in process.children(recursive=True):
+                child = self.process_dict_update(child)
+                taskCPU += child.cpu_percent(interval=0) / ncores
+        except psutil.NoSuchProcess as e:
+            print(e.pid, "killed before analysis")
+        totalCPU = psutil.cpu_percent(interval=0)
+        return taskCPU, totalCPU
 
     def measure(self, chunk):
         """
@@ -101,77 +135,33 @@ class MeasurementStatistics:
         measurement = {"timedelta": timestamp}
 
         lines = chunk.strip().split("\n")
+        req_fields_met = len(self.REQUIRED_FIELDS)
         for line in lines:
             try:
                 field, value = line.split(":")
+                field = field.strip()
+                # Map "Power" from input to "totalPower" in our system
+               
                 if field in self.REQUIRED_FIELDS:
-                    field = field.strip()
+                    name = field
+                    if field == "Power":
+                        name = "totalPower"
+                    req_fields_met -= 1
                     valid_val = self.__validate(field, value.strip())
                     if valid_val != None:
-                        measurement[field] = valid_val
+                        measurement[name] = valid_val
             except ValueError:
                 pass
 
-        for rq_field in self.REQUIRED_FIELDS:
-            if rq_field not in measurement:
-                self.error_count += 1
-                return
-
+        taskCPU, totalCPU = self.get_cpu_load()
+        measurement["taskCPU"] = taskCPU
+        measurement["totalCPU"] = totalCPU
+        if req_fields_met > 0:
+            self.error_count += 1
+            return
+                
         # Append the new measurement as a row in the DataFrame
         self.data = pd.concat([self.data, pd.DataFrame([measurement])], ignore_index=True)
-
-    def floor_power(self):
-        """
-        Calculate the floor power value of the system during idle operation,
-        dynamically excluding the startup peak period.
-        Returns:
-        - float: The calculated floor power value in watts.
-        """
-        if self.data is None or self.data.empty:
-            raise MeasurementError("No data available for calculation.")
-        
-        if 'Power' not in self.data.columns:
-            raise MeasurementError("Power data not available in statistics.")
-
-        power_data = self.data[['timedelta', 'Power']].copy()
-
-        # Step 1: Identify the peak region
-        global_mean = power_data['Power'].mean()
-        global_std = power_data['Power'].std()
-
-        # Identify rows that are part of the peak (more than 2 standard deviations above the mean)
-        peak_condition = power_data['Power'] > (global_mean + global_std)
-        peak_end_index = 0
-
-        # Find the endpoint of the peak region (last occurrence of a peak value)
-        for i in range(len(power_data)):
-            if peak_condition.iloc[i]:
-                peak_end_index = i
-        if peak_end_index >= len(power_data) / 2:
-            peak_end_index = 0 # assume no peak here
-
-        # Exclude the peak region
-        power_data = power_data.iloc[peak_end_index + 1:]
-        if power_data.empty:
-            raise MeasurementError("Insufficient data after excluding the peak region.")
-
-        # Step 2: Detect and remove remaining outliers (Z-Score Method)
-        mean_power = power_data['Power'].mean()
-        std_power = power_data['Power'].std()
-        power_data['Z-Score'] = (power_data['Power'] - mean_power) / std_power
-
-        filtered_data = power_data[power_data['Z-Score'].abs() < 3]
-        if filtered_data.empty:
-            raise MeasurementError("All power values are considered outliers.")
-
-        # Step 3: Calculate the floor power value (IQR Method)
-        Q1 = filtered_data['Power'].quantile(0.25)
-        Q3 = filtered_data['Power'].quantile(0.75)
-        IQR = Q3 - Q1
-        floor_value = Q1 - 1.5 * IQR
-        # Ensure the floor value is reasonable
-        floor_value = max(floor_value, 0)
-        return floor_value
     
     def error_rate(self) -> float:
         if not hasattr(self, 'total_measures') or self.total_measures == 0:
@@ -188,19 +178,19 @@ class MeasurementStatistics:
             summary['taskPower'] = None
 
         try:
-            summary['Current'] = self.data['Current'].mean()
+            summary['totalPower'] = self.data['totalPower'].mean()
         except KeyError:
-            summary['Current'] = None
-
-        try:
-            summary['Voltage'] = self.data['Voltage'].mean()
-        except KeyError:
-            summary['Voltage'] = None
+            summary['totalPower'] = None
 
         try:
             summary['taskEnergy'] = self.data['taskEnergy'].iloc[-1] if 'taskEnergy' in self.data.columns else None
         except IndexError:
             summary['taskEnergy'] = None
+
+        try:
+            summary['totalEnergy'] = self.data['totalEnergy'].iloc[-1] if 'totalEnergy' in self.data.columns else None
+        except IndexError:
+            summary['totalEnergy'] = None
 
         return summary
 
@@ -235,12 +225,12 @@ class MeasurementPlotter:
     - statistics (MeasurementStatistics): The instance containing recorded data.
     """
     UNITS = {
-        "Voltage": "Voltage (V)",
-        "Current": "Current (A)",
-        "Power": "Power (W)",
-        "Energy": "Energy (J)",
+        "taskEnergy": "Task Energy (J)",
         "taskPower": "Task Power (W)",
-        "taskEnergy": "Task Energy (J)"
+        "taskCPU": "Task CPU (%)",
+        "totalEnergy": "Total Energy (J)",
+        "totalPower": "Total Power (W)",
+        "totalCPU": "Total CPU (%)",
     }
     def __init__(self, statistics):
         """
@@ -280,7 +270,8 @@ class MeasurementPlotter:
         fig.suptitle('Measurement Statistics Over Time', fontsize=16)
 
         # Data for plotting
-        columns = ['Voltage', 'Current', 'Power', 'taskPower', 'Energy', 'taskEnergy']
+        columns = ['taskEnergy', 'taskPower', 'taskCPU', 
+                   'totalEnergy', 'totalPower', 'totalCPU']
         ax_positions = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]
 
         # Plot each measurement
@@ -304,6 +295,7 @@ class MeasurementPlotter:
         plt.show()
     
 import argparse
+
 def parse_arguments():
     """
     Parse and validate command-line arguments.
@@ -352,16 +344,12 @@ def parse_arguments():
 
     return params
 
-def test_arguments(params: dict, test_len: int) -> dict:
-    return {
-        "port": params["port"],
-        "time": test_len,
-        "exec": None
-    }
-
 import subprocess
 from datetime import datetime, timedelta
 import serial
+import os
+import json
+import glob
 
 class MeasurementRunner:
     """
@@ -510,30 +498,89 @@ class MeasurementRunner:
 
         return self.stat
 
-def main():
-    test_length = 20
-    params = parse_arguments()
+import pandas as pd
 
+def power_get_floor(stat: MeasurementStatistics):
+    totalPower = stat.get('totalPower')
+    floor_power = totalPower.mean()
+    return floor_power
+
+def measure_floor_power() -> float:
+
+    params = {
+        "port": "/dev/ttyACM0",
+        "time": 5,
+        "exec": None,
+    }
     stat = MeasurementStatistics()
-    stat.start()
-
-    print(f"Gathering idle system data for {test_length} seconds")
-    test_params = test_arguments(params, test_length)
-    reader = MeasurementRunner(test_params, stat)
-    reader.run()
-    stat.end()
-    floor_power = stat.floor_power()
-
-    print(f"Running main load, with idle power {floor_power}")
     reader = MeasurementRunner(params, stat)
-    stat.start(floor_power)
+    stat.start()
+    reader.run()
+    stat.end()
+    return power_get_floor(stat)
+
+def measure_single_round(stat: MeasurementStatistics, params: dict) -> dict:
+    # Find the most recent HEPscore directory
+    summary = ""
+    reader = MeasurementRunner(params, stat)
+    stat.start()
     reader.run()
     stat.end()
 
-    print("Error rate: ", stat.error_rate())
-    print(stat.getSummary())
+    hepscore_dirs = glob.glob("testdir/HEPscore_*")
+    if hepscore_dirs:
+        latest_dir = max(hepscore_dirs, key=os.path.getctime)
+        json_file = os.path.join(latest_dir, "HEPscoreTestKV.json")
+        
+        if os.path.exists(json_file):
+            try:
+                with open(json_file, 'r') as f:
+                    hep_data = json.load(f)
+                    
+                energy_result = hep_data.get("energy")
+                if energy_result is not None:
+                    print(f"HEPscore energy result: {energy_result} J")
+                    summary = stat.getSummary()
+                    print(f"Measured energy: {summary['taskEnergy']} J")
+                    
+                    if summary['taskEnergy'] is not None and energy_result > 0:
+                        ratio = summary['taskEnergy'] / energy_result
+                        print(f"Ratio (measured/reported): {ratio:.4f}")
+            except Exception as e:
+                print(f"Error processing HEPscore results: {e}")
+        else:
+            print(f"HEPscore results file not found: {json_file}")
+    else:
+        print("No HEPscore results directory found")
+        summary = stat.getSummary()
+
+    print(summary)
     plotter = MeasurementPlotter(stat)
     plotter.draw()
+    task_energy = int(summary['taskEnergy'])
+    return { "pzemEnergy": task_energy, "hepEnergy": energy_result }
+
+def main():
+    sample_count = 1
+    params = parse_arguments()
+    params = {
+        "port": "/dev/ttyACM0",
+        "time": None,
+        "exec": "sudo hep-score -v -m docker -f hepscore_short.yaml ./testdir",
+    }
+
+    floor_power = measure_floor_power()
+
+    stat = MeasurementStatistics(floor_power)
+
+    energy_df = pd.DataFrame(columns=["taskEnergy", "hepscoreEnergy"])
+    for i in range(sample_count):
+        row = measure_single_round(stat, params)
+        energy_df = pd.concat([energy_df, pd.DataFrame([row])], ignore_index=True)
+    
+    energy_df.to_csv("atlas-gen-bmk.csv", index=False)
+
+    # Find the HEPscore results directory
 
 
 if __name__ == "__main__":
